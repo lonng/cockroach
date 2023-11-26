@@ -271,7 +271,7 @@ func (ex *connExecutor) execPortal(
 //
 // This method also handles "auto commit" - committing of implicit transactions.
 //
-// If an error is returned, the connection is supposed to be consider done.
+// If an error is returned, the connection is supposed to be considered done.
 // Query execution errors are not returned explicitly; they're incorporated in
 // the returned Event.
 //
