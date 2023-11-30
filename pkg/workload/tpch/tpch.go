@@ -14,7 +14,9 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
+	"io"
 	"math"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -65,6 +67,7 @@ type tpch struct {
 	vectorize                  string
 	useClusterVectorizeSetting bool
 	verbose                    bool
+	explain                    string
 
 	queriesRaw      string
 	selectedQueries []int
@@ -111,6 +114,8 @@ var tpchMeta = workload.Meta{
 			`Set vectorize session variable.`)
 		g.flags.BoolVar(&g.useClusterVectorizeSetting, `default-vectorize`, false,
 			`Ignore vectorize option and use the current cluster setting sql.defaults.vectorize.`)
+		g.flags.StringVar(&g.explain, `explain`, "",
+			`Prints out the execution plan of the queries`)
 		g.flags.BoolVar(&g.verbose, `verbose`, false,
 			`Prints out the queries being run as well as histograms.`)
 		g.connFlags = workload.NewConnFlags(&g.flags)
@@ -336,6 +341,16 @@ func (w *worker) run(ctx context.Context) error {
 	if !w.config.useClusterVectorizeSetting {
 		prefix = fmt.Sprintf("SET vectorize = '%s';", w.config.vectorize)
 	}
+	var explain io.WriteCloser
+	if w.config.explain != "" {
+		f, err := os.OpenFile(w.config.explain, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			return errors.Wrapf(err, "open file: %s", w.config.explain)
+		}
+		explain = f
+		defer func() { _ = explain.Close() }()
+		prefix = prefix + "EXPLAIN "
+	}
 	query := fmt.Sprintf("%s %s", prefix, w.queries[queryNum])
 
 	vals := make([]interface{}, maxCols)
@@ -435,22 +450,43 @@ func (w *worker) run(ctx context.Context) error {
 		return nil
 	}
 
-	expectedOutputError := checkExpectedOutput()
+	if explain != nil {
+		lines := []string{fmt.Sprintf("# TPCH Q%d: ", queryNum), strings.TrimSpace(query[len(prefix):]), "---"}
+		for rows.Next() {
+			var line string
+			err := rows.Scan(&line)
+			if err != nil {
+				return errors.Wrap(err, "read line failed")
+			}
+			lines = append(lines, line)
+		}
+		if err := rows.Err(); err != nil {
+			return errors.Wrapf(err, "[q%d]", queryNum)
+		}
 
-	// In order to definitely get the error below, we need to fully consume the
-	// result set.
-	for rows.Next() {
+		_, err := explain.Write([]byte(strings.Join(lines, "\n") + "\n\n"))
+		if err != nil {
+			return errors.Wrap(err, "write explain result failed")
+		}
+	} else {
+		expectedOutputError := checkExpectedOutput()
+
+		// In order to definitely get the error below, we need to fully consume the
+		// result set.
+		for rows.Next() {
+		}
+
+		// We first check whether there is any error that came from the server (for
+		// example, an out of memory error). If there is, we return it.
+		if err := rows.Err(); err != nil {
+			return errors.Wrapf(err, "[q%d]", queryNum)
+		}
+		// Now we check whether there was an error while consuming the rows.
+		if expectedOutputError != nil {
+			return wrongOutputError{error: expectedOutputError}
+		}
 	}
 
-	// We first check whether there is any error that came from the server (for
-	// example, an out of memory error). If there is, we return it.
-	if err := rows.Err(); err != nil {
-		return errors.Wrapf(err, "[q%d]", queryNum)
-	}
-	// Now we check whether there was an error while consuming the rows.
-	if expectedOutputError != nil {
-		return wrongOutputError{error: expectedOutputError}
-	}
 	if w.config.enableChecks {
 		numRowsExpected, checkOnlyRowCount := numExpectedRowsByQueryNumber[queryNum]
 		if checkOnlyRowCount && numRows != numRowsExpected {
